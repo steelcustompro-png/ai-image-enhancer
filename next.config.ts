@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  // No static export — need server for API Routes (Real-ESRGAN)
 };
 
 export default nextConfig;

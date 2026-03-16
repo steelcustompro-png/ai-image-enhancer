@@ -9,6 +9,7 @@ export default function Hero() {
   const [result, setResult] = useState<string>('');
   const [scale, setScale] = useState<number>(2);
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState<string>('');
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -32,15 +33,30 @@ export default function Hero() {
   const handleEnhance = async () => {
     if (!file) return;
     setLoading(true);
+    setProgress('Uploading & enhancing...');
     try {
-      // TODO: Replace with actual Replicate API call
-      // For now, simulate processing
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      setResult(preview); // Placeholder: show original as result
-    } catch {
-      alert('Enhancement failed. Please try again.');
+      const formData = new FormData();
+      formData.append('image', file);
+      formData.append('scale', String(scale));
+
+      const res = await fetch('/api/enhance', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(err.error || `Server error ${res.status}`);
+      }
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      setResult(url);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Enhancement failed. Please try again.');
     }
     setLoading(false);
+    setProgress('');
   };
 
   const handleDownload = () => {
@@ -101,6 +117,14 @@ export default function Hero() {
 
             {/* Image preview */}
             <div className="relative bg-white rounded-2xl border border-gray-200 overflow-hidden shadow-sm">
+              {/* Close / remove image button */}
+              {!loading && (
+                <button onClick={reset}
+                  className="absolute top-3 right-3 z-10 w-8 h-8 flex items-center justify-center rounded-full bg-black/50 text-white hover:bg-black/70 transition"
+                  aria-label="Remove image">
+                  ✕
+                </button>
+              )}
               {result ? (
                 <div className="grid grid-cols-2 gap-0">
                   <div className="relative">
@@ -125,7 +149,7 @@ export default function Hero() {
                   {loading ? (
                     <span className="flex items-center gap-2">
                       <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                      {t('btn_enhancing')}
+                      {progress || t('btn_enhancing')}
                     </span>
                   ) : t('btn_enhance')}
                 </button>
