@@ -41,6 +41,12 @@ export const i18n = {
     lang_switch: '中文',
     nav_pricing: 'Pricing',
     nav_login: 'Sign In',
+    nav_logout: 'Sign Out',
+    usage_today: 'today',
+    plan_free: 'Free Plan',
+    limit_reached: 'Daily limit reached',
+    limit_hint_anon: 'Sign in for more free uses',
+    limit_hint_free: 'Upgrade for unlimited access',
   },
   zh: {
     site_name: 'AI 图片增强器',
@@ -84,6 +90,12 @@ export const i18n = {
     lang_switch: 'EN',
     nav_pricing: '定价',
     nav_login: '登录',
+    nav_logout: '退出登录',
+    usage_today: '今日',
+    plan_free: '免费版',
+    limit_reached: '今日次数已用完',
+    limit_hint_anon: '登录获取更多免费次数',
+    limit_hint_free: '升级获取无限使用',
   }
 } as const;
 

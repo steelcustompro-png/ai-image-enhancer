@@ -1,9 +1,11 @@
 'use client';
 import { useState, useRef, useCallback } from 'react';
 import { useLang } from '@/lib/lang-context';
+import { useAuth } from '@/lib/auth-context';
 
 export default function Hero() {
   const { t } = useLang();
+  const { token, usage, refreshUsage } = useAuth();
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string>('');
   const [result, setResult] = useState<string>('');
@@ -40,8 +42,11 @@ export default function Hero() {
       formData.append('scale', String(scale));
 
       const apiBase = process.env.NEXT_PUBLIC_API_URL || '';
+      const headers: Record<string, string> = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
       const res = await fetch(`${apiBase}/api/enhance`, {
         method: 'POST',
+        headers,
         body: formData,
       });
 
@@ -53,6 +58,7 @@ export default function Hero() {
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       setResult(url);
+      await refreshUsage();
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Enhancement failed. Please try again.');
     }

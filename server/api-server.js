@@ -4,111 +4,123 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const path = require('path');
 const crypto = require('crypto');
+const Database = require('better-sqlite3');
+const jwt = require('jsonwebtoken');
 
 const execFileAsync = promisify(execFile);
 const REALESRGAN_BIN = '/usr/local/realesrgan/realesrgan-ncnn-vulkan';
 const TMP_DIR = '/tmp/enhance-jobs';
 const PORT = 3001;
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 
-// Allowed origins for CORS
+// --- Database Setup ---
+const DB_PATH = path.join(__dirname, 'data', 'app.db');
+require('fs').mkdirSync(path.join(__dirname, 'data'), { recursive: true });
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    google_id TEXT UNIQUE NOT NULL,
+    email TEXT NOT NULL,
+    name TEXT,
+    avatar TEXT,
+    plan TEXT DEFAULT 'free',
+    credits INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS usage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    ip TEXT,
+    scale INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_usage_user_date ON usage_log(user_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_usage_ip_date ON usage_log(ip, created_at);
+`);
+
+// --- Daily usage limits ---
+const LIMITS = { anonymous: 1, free: 3, paid: 999999 };
+
+function getTodayUsage(userId, ip) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (userId) {
+    const row = db.prepare(
+      `SELECT COUNT(*) as cnt FROM usage_log WHERE user_id = ? AND created_at >= ?`
+    ).get(userId, today + 'T00:00:00');
+    return row.cnt;
+  }
+  const row = db.prepare(
+    `SELECT COUNT(*) as cnt FROM usage_log WHERE user_id IS NULL AND ip = ? AND created_at >= ?`
+  ).get(ip, today + 'T00:00:00');
+  return row.cnt;
+}
+
+function logUsage(userId, ip, scale) {
+  db.prepare(
+    `INSERT INTO usage_log (user_id, ip, scale) VALUES (?, ?, ?)`
+  ).run(userId, ip, scale);
+}
+
+function getOrCreateUser(googleId, email, name, avatar) {
+  let user = db.prepare('SELECT * FROM users WHERE google_id = ?').get(googleId);
+  if (!user) {
+    db.prepare(
+      'INSERT INTO users (google_id, email, name, avatar) VALUES (?, ?, ?, ?)'
+    ).run(googleId, email, name, avatar);
+    user = db.prepare('SELECT * FROM users WHERE google_id = ?').get(googleId);
+  }
+  return user;
+}
+
+function signToken(user) {
+  return jwt.sign(
+    { userId: user.id, email: user.email, name: user.name, avatar: user.avatar, plan: user.plan },
+    JWT_SECRET,
+    { expiresIn: '30d' }
+  );
+}
+
+function verifyToken(token) {
+  try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
+}
+
+function getUserFromReq(req) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  return token ? verifyToken(token) : null;
+}
+
+function getClientIp(req) {
+  return req.headers['x-real-ip'] || req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+}
+
+// --- CORS ---
 const ALLOWED_ORIGINS = [
-  'https://ai-image-enhancer.pages.dev',
+  'https://aiimageenhancer.xyz',
+  'https://www.aiimageenhancer.xyz',
+  'https://ai-image-enhancer-f13.pages.dev',
+  'https://api.aiimageenhancer.xyz',
   'http://localhost:3000',
   'http://127.0.0.1:3000',
 ];
 
 function setCors(req, res) {
   const origin = req.headers.origin || '';
-  // Allow any *.pages.dev subdomain or listed origins
   if (ALLOWED_ORIGINS.includes(origin) || /\.pages\.dev$/.test(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   } else {
     res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGINS[0]);
   }
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
-const server = http.createServer(async (req, res) => {
-  setCors(req, res);
-
-  // Handle preflight
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/api/enhance') {
-    try {
-      // Parse multipart form data manually
-      const boundary = getBoundary(req.headers['content-type']);
-      if (!boundary) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid content type' }));
-        return;
-      }
-
-      const body = await collectBody(req, 20 * 1024 * 1024); // 20MB limit
-      const parts = parseMultipart(body, boundary);
-
-      const imagePart = parts.find(p => p.name === 'image');
-      const scalePart = parts.find(p => p.name === 'scale');
-
-      if (!imagePart) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'No image provided' }));
-        return;
-      }
-
-      const scale = Number(scalePart?.value || 2);
-      const validScale = scale === 4 ? 4 : 2;
-
-      await mkdir(TMP_DIR, { recursive: true });
-      const id = crypto.randomUUID();
-      const rawPath = path.join(TMP_DIR, `${id}-raw`);
-      const inputPath = path.join(TMP_DIR, `${id}-input.png`);
-      const outputPath = path.join(TMP_DIR, `${id}-output.png`);
-
-      await writeFile(rawPath, imagePart.data);
-
-      // Fix EXIF orientation
-      await execFileAsync('convert', [rawPath, '-auto-orient', inputPath], { timeout: 10000 });
-
-      // Run Real-ESRGAN
-      const model = validScale === 4 ? 'realesr-animevideov3-x4' : 'realesr-animevideov3-x2';
-      await execFileAsync(REALESRGAN_BIN, [
-        '-i', inputPath, '-o', outputPath,
-        '-n', model, '-s', String(validScale),
-      ], { timeout: 300000 });
-
-      const resultBuffer = await readFile(outputPath);
-
-      // Cleanup
-      await unlink(rawPath).catch(() => {});
-      await unlink(inputPath).catch(() => {});
-      await unlink(outputPath).catch(() => {});
-
-      res.writeHead(200, {
-        'Content-Type': 'image/png',
-        'Content-Disposition': `attachment; filename="enhanced-${validScale}x.png"`,
-        'Content-Length': resultBuffer.length,
-      });
-      res.end(resultBuffer);
-    } catch (err) {
-      console.error('Enhance error:', err.message || err);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message || 'Enhancement failed' }));
-    }
-  } else {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
-  }
-});
-
-// --- Multipart parser helpers ---
-
+// --- Multipart parser ---
 function getBoundary(contentType) {
   if (!contentType) return null;
   const match = contentType.match(/boundary=(?:"([^"]+)"|([^\s;]+))/);
@@ -132,46 +144,32 @@ function collectBody(req, maxSize) {
 function parseMultipart(body, boundary) {
   const parts = [];
   const boundaryBuf = Buffer.from(`--${boundary}`);
-  const endBuf = Buffer.from(`--${boundary}--`);
-
   let start = indexOf(body, boundaryBuf, 0);
   if (start === -1) return parts;
-
   while (true) {
     start += boundaryBuf.length;
-    // Skip \r\n after boundary
     if (body[start] === 0x0d && body[start + 1] === 0x0a) start += 2;
-
     const nextBoundary = indexOf(body, boundaryBuf, start);
     if (nextBoundary === -1) break;
-
     const partData = body.slice(start, nextBoundary);
-    // Find header/body separator \r\n\r\n
     const headerEnd = indexOf(partData, Buffer.from('\r\n\r\n'), 0);
     if (headerEnd === -1) { start = nextBoundary; continue; }
-
     const headerStr = partData.slice(0, headerEnd).toString('utf8');
     let content = partData.slice(headerEnd + 4);
-    // Remove trailing \r\n
     if (content.length >= 2 && content[content.length - 2] === 0x0d && content[content.length - 1] === 0x0a) {
       content = content.slice(0, content.length - 2);
     }
-
     const nameMatch = headerStr.match(/name="([^"]+)"/);
     const name = nameMatch ? nameMatch[1] : '';
     const filenameMatch = headerStr.match(/filename="([^"]+)"/);
-
     if (filenameMatch) {
       parts.push({ name, filename: filenameMatch[1], data: content });
     } else {
       parts.push({ name, value: content.toString('utf8') });
     }
-
-    // Check if next boundary is the end
-    if (indexOf(body, endBuf, nextBoundary) === nextBoundary) break;
+    if (indexOf(body, Buffer.from(`--${boundary}--`), nextBoundary) === nextBoundary) break;
     start = nextBoundary;
   }
-
   return parts;
 }
 
@@ -186,6 +184,170 @@ function indexOf(buf, search, from) {
   return -1;
 }
 
+function collectJSON(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString())); } catch(e) { reject(e); } });
+    req.on('error', reject);
+  });
+}
+
+// --- Routes ---
+const server = http.createServer(async (req, res) => {
+  setCors(req, res);
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  // --- Google OAuth callback ---
+  if (req.method === 'POST' && url.pathname === '/api/auth/google') {
+    try {
+      const { credential } = await collectJSON(req);
+      // Verify Google ID token
+      const resp = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${credential}`);
+      const payload = await resp.json();
+      if (payload.error || (GOOGLE_CLIENT_ID && payload.aud !== GOOGLE_CLIENT_ID)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid Google token' }));
+        return;
+      }
+      const user = getOrCreateUser(payload.sub, payload.email, payload.name, payload.picture);
+      const token = signToken(user);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ token, user: { id: user.id, email: user.email, name: user.name, avatar: user.avatar, plan: user.plan } }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // --- Get current user info + usage ---
+  if (req.method === 'GET' && url.pathname === '/api/auth/me') {
+    const tokenUser = getUserFromReq(req);
+    if (!tokenUser) {
+      const ip = getClientIp(req);
+      const used = getTodayUsage(null, ip);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ user: null, usage: { used, limit: LIMITS.anonymous } }));
+      return;
+    }
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(tokenUser.userId);
+    const used = getTodayUsage(user.id, null);
+    const plan = user.credits > 0 ? 'paid' : user.plan;
+    const limit = plan === 'paid' ? LIMITS.paid : LIMITS.free;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      user: { id: user.id, email: user.email, name: user.name, avatar: user.avatar, plan, credits: user.credits },
+      usage: { used, limit }
+    }));
+    return;
+  }
+
+  // --- Enhance API ---
+  if (req.method === 'POST' && url.pathname === '/api/enhance') {
+    try {
+      const tokenUser = getUserFromReq(req);
+      const ip = getClientIp(req);
+
+      // Check usage limits
+      let userId = null;
+      let limit = LIMITS.anonymous;
+      if (tokenUser) {
+        userId = tokenUser.userId;
+        const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+        if (user.credits > 0) {
+          limit = LIMITS.paid;
+        } else {
+          limit = LIMITS.free;
+        }
+      }
+      const used = getTodayUsage(userId, ip);
+      if (used >= limit) {
+        // Check if paid user has credits
+        if (userId) {
+          const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(userId);
+          if (user.credits <= 0) {
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Daily limit reached. Please upgrade for more.', code: 'LIMIT_REACHED' }));
+            return;
+          }
+        } else {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Daily limit reached. Sign in for more free uses.', code: 'LIMIT_REACHED' }));
+          return;
+        }
+      }
+
+      const boundary = getBoundary(req.headers['content-type']);
+      if (!boundary) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid content type' }));
+        return;
+      }
+
+      const body = await collectBody(req, 20 * 1024 * 1024);
+      const parts = parseMultipart(body, boundary);
+      const imagePart = parts.find(p => p.name === 'image');
+      const scalePart = parts.find(p => p.name === 'scale');
+
+      if (!imagePart) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'No image provided' }));
+        return;
+      }
+
+      const scale = Number(scalePart?.value || 2);
+      const validScale = scale === 4 ? 4 : 2;
+
+      await mkdir(TMP_DIR, { recursive: true });
+      const id = crypto.randomUUID();
+      const rawPath = path.join(TMP_DIR, `${id}-raw`);
+      const inputPath = path.join(TMP_DIR, `${id}-input.png`);
+      const outputPath = path.join(TMP_DIR, `${id}-output.png`);
+
+      await writeFile(rawPath, imagePart.data);
+      await execFileAsync('convert', [rawPath, '-auto-orient', inputPath], { timeout: 10000 });
+
+      const model = validScale === 4 ? 'realesr-animevideov3-x4' : 'realesr-animevideov3-x2';
+      await execFileAsync(REALESRGAN_BIN, [
+        '-i', inputPath, '-o', outputPath, '-n', model, '-s', String(validScale),
+      ], { timeout: 300000 });
+
+      const resultBuffer = await readFile(outputPath);
+      await unlink(rawPath).catch(() => {});
+      await unlink(inputPath).catch(() => {});
+      await unlink(outputPath).catch(() => {});
+
+      // Log usage & deduct credits
+      logUsage(userId, ip, validScale);
+      if (userId) {
+        const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(userId);
+        if (user.credits > 0) {
+          db.prepare('UPDATE users SET credits = credits - 1 WHERE id = ?').run(userId);
+        }
+      }
+
+      res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Content-Disposition': `attachment; filename="enhanced-${validScale}x.png"`,
+        'Content-Length': resultBuffer.length,
+      });
+      res.end(resultBuffer);
+    } catch (err) {
+      console.error('Enhance error:', err.message || err);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || 'Enhancement failed' }));
+    }
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
+});
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Enhance API server running on port ${PORT}`);
+  console.log(`Google OAuth: ${GOOGLE_CLIENT_ID ? 'configured' : 'not configured (set GOOGLE_CLIENT_ID)'}`);
 });
