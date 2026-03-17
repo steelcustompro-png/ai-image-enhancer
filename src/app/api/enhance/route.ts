@@ -38,10 +38,12 @@ export async function POST(req: NextRequest) {
     ], { timeout: 10000 });
 
     // Run Real-ESRGAN (timeout 5 min for CPU)
+    // Use native x4 model for 4x (much faster than running 2x twice)
+    const model = validScale === 4 ? 'realesr-animevideov3-x4' : 'realesr-animevideov3-x2';
     await execFileAsync(REALESRGAN_BIN, [
       '-i', inputPath,
       '-o', outputPath,
-      '-n', 'realesr-animevideov3-x2',
+      '-n', model,
       '-s', String(validScale),
     ], { timeout: 300000 });
 

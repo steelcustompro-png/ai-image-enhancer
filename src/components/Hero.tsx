@@ -39,7 +39,8 @@ export default function Hero() {
       formData.append('image', file);
       formData.append('scale', String(scale));
 
-      const res = await fetch('/api/enhance', {
+      const apiBase = process.env.NEXT_PUBLIC_API_URL || '';
+      const res = await fetch(`${apiBase}/api/enhance`, {
         method: 'POST',
         body: formData,
       });
