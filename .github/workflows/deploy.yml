@@ -24,9 +24,7 @@ jobs:
         run: npm install
       
       - name: Build
-        env:
-          TURBOPACK: "0"
-        run: npx --yes next build
+        run: npx --yes next build --no-turbo
       
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
