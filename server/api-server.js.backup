@@ -1,4 +1,3 @@
-const { handleRegister, handleLogin } = require('./auth-handlers');
 const http = require('http');
 const { writeFile, readFile, unlink, mkdir } = require('fs/promises');
 const { execFile } = require('child_process');
@@ -11,88 +10,6 @@ const jwt = require('jsonwebtoken');
 const execFileAsync = promisify(execFile);
 const REALESRGAN_BIN = '/usr/local/realesrgan/realesrgan-ncnn-vulkan';
 const TMP_DIR = '/tmp/enhance-jobs';
-const ALIYUN_API_KEY = 'sk-752c05ce5f844955ae189b2fdefd72c0';
-
-// 阿里云超分：上传图片到临时URL并调用DashScope API
-async function enhanceWithAliyun(imageBuffer, scale) {
-  const https = require('https');
-  
-  // 1. 把图片转base64上传到阿里云OSS临时URL（用DashScope file upload）
-  const base64Image = imageBuffer.toString('base64');
-  const mimeType = 'image/png';
-  
-  // 使用DashScope的file upload接口
-  const uploadRes = await fetch('https://dashscope.aliyuncs.com/api/v1/files', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${ALIYUN_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      files: [{ name: 'image.png', content: base64Image, content_type: mimeType }]
-    })
-  });
-  
-  let imageUrl;
-  if (uploadRes.ok) {
-    const uploadData = await uploadRes.json();
-    imageUrl = uploadData?.output?.files?.[0]?.url;
-  }
-  
-  // 如果upload失败，改用data URL直传
-  if (!imageUrl) {
-    imageUrl = `data:${mimeType};base64,${base64Image}`;
-  }
-  
-  // 2. 提交超分任务
-  const submitRes = await fetch('https://dashscope.aliyuncs.com/api/v1/services/aigc/image2image/image-synthesis', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${ALIYUN_API_KEY}`,
-      'Content-Type': 'application/json',
-      'X-DashScope-Async': 'enable',
-    },
-    body: JSON.stringify({
-      model: 'wanx2.1-imageedit',
-      input: {
-        function: 'super_resolution',
-        base_image_url: imageUrl,
-        prompt: 'enhance image quality, increase resolution, sharp details',
-      },
-      parameters: { upscale_factor: scale }
-    })
-  });
-  
-  const submitData = await submitRes.json();
-  if (!submitData?.output?.task_id) {
-    throw new Error('超分任务提交失败: ' + JSON.stringify(submitData));
-  }
-  
-  const taskId = submitData.output.task_id;
-  
-  // 3. 轮询任务结果（最多等120秒）
-  for (let i = 0; i < 40; i++) {
-    await new Promise(r => setTimeout(r, 3000));
-    const pollRes = await fetch(`https://dashscope.aliyuncs.com/api/v1/tasks/${taskId}`, {
-      headers: { 'Authorization': `Bearer ${ALIYUN_API_KEY}` }
-    });
-    const pollData = await pollRes.json();
-    const status = pollData?.output?.task_status;
-    
-    if (status === 'SUCCEEDED') {
-      const resultUrl = pollData?.output?.output_image_url?.[0] || pollData?.output?.results?.[0]?.url;
-      if (!resultUrl) throw new Error('超分结果URL为空');
-      
-      // 4. 下载结果图片
-      const imgRes = await fetch(resultUrl);
-      const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
-      return imgBuffer;
-    } else if (status === 'FAILED') {
-      throw new Error('超分任务失败: ' + JSON.stringify(pollData?.output));
-    }
-  }
-  throw new Error('超分任务超时');
-}
 const PORT = 3001;
 const JWT_SECRET = "ai-image-enhancer-jwt-secret-2024";
 
@@ -298,23 +215,6 @@ const server = http.createServer(async (req, res) => {
 
   // --- Google OAuth callback ---
   // Email: Send code
-  
-  // Register
-  if (req.method === 'POST' && url.pathname === '/api/auth/register') {
-    const body = await collectJSON(req);
-    const result = handleRegister(db, body.email, body.password);
-    if (result.error) { res.writeHead(400); res.end(JSON.stringify(result)); return; }
-    res.writeHead(200); res.end(JSON.stringify(result)); return;
-  }
-
-  // Login
-  if (req.method === 'POST' && url.pathname === '/api/auth/login') {
-    const body = await collectJSON(req);
-    const result = handleLogin(db, body.email, body.password);
-    if (result.error) { res.writeHead(401); res.end(JSON.stringify(result)); return; }
-    res.writeHead(200); res.end(JSON.stringify(result)); return;
-  }
-
   if (req.method === 'POST' && url.pathname === '/api/auth/email/send') {
     const body = await collectJSON(req);
     const { email } = body;
@@ -385,132 +285,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // --- 使用记录 ---
-  if (req.method === 'GET' && url.pathname === '/api/auth/history') {
-    const tokenUser = getUserFromReq(req);
-    if (!tokenUser) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
-    const records = db.prepare(
-      'SELECT id, scale, created_at FROM usage_log WHERE user_id = ? ORDER BY created_at DESC LIMIT 50'
-    ).all(tokenUser.userId);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ records }));
-    return;
-  }
-
-  // --- 充值记录 ---
-  if (req.method === 'GET' && url.pathname === '/api/pay/history') {
-    const tokenUser = getUserFromReq(req);
-    if (!tokenUser) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
-    const records = db.prepare(
-      "SELECT id, amount, credits, currency, status, created_at FROM payment_log WHERE user_id = ? AND status != 'pending' ORDER BY created_at DESC LIMIT 50"
-    ).all(tokenUser.userId);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ records }));
-    return;
-  }
-
-  // --- PayPal 支付 ---
-  const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
-  const PAYPAL_SECRET = process.env.PAYPAL_SECRET || '';
-  const PAYPAL_BASE = process.env.PAYPAL_SANDBOX === 'true'
-    ? 'https://api-m.sandbox.paypal.com'
-    : 'https://api-m.paypal.com';
-  const SITE_URL = 'https://aiimageenhancer.xyz';
-  const API_URL = 'https://api.aiimageenhancer.xyz';
-
-  async function getPaypalToken() {
-    const creds = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_SECRET}`).toString('base64');
-    const res = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
-      method: 'POST',
-      headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'grant_type=client_credentials'
-    });
-    const data = await res.json();
-    return data.access_token;
-  }
-
-  // 创建支付订单
-  if (req.method === 'POST' && url.pathname === '/api/pay/create') {
-    const tokenUser = getUserFromReq(req);
-    if (!tokenUser) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
-    const body = await collectJSON(req);
-    const { price, credits } = body;
-    if (!price || !credits) { res.writeHead(400); res.end(JSON.stringify({ error: 'Missing price or credits' })); return; }
-    try {
-      const accessToken = await getPaypalToken();
-      const orderRes = await fetch(`${PAYPAL_BASE}/v2/checkout/orders`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          intent: 'CAPTURE',
-          purchase_units: [{
-            amount: { currency_code: 'USD', value: price.toFixed(2) },
-            description: `AI Image Enhancer - ${credits} Credits`,
-            custom_id: `${tokenUser.userId}:${credits}`,
-          }],
-          application_context: {
-            brand_name: 'AI Image Enhancer',
-            return_url: `${API_URL}/api/pay/success`,
-            cancel_url: `${API_URL}/api/pay/cancel`,
-          }
-        })
-      });
-      const order = await orderRes.json();
-      const approveUrl = order.links?.find(l => l.rel === 'approve')?.href;
-      if (!approveUrl) throw new Error('No approve URL: ' + JSON.stringify(order));
-      // 记录待支付订单
-      db.prepare('INSERT OR IGNORE INTO payment_log (user_id, amount, credits, currency, paypal_order_id, status) VALUES (?,?,?,?,?,?)')
-        .run(tokenUser.userId, price, credits, 'USD', order.id, 'pending');
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ approveUrl, orderId: order.id }));
-    } catch (e) {
-      console.error('PayPal create error:', e.message);
-      res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // 支付成功回调（PayPal重定向回来）
-  if (req.method === 'GET' && url.pathname === '/api/pay/success') {
-    const orderId = url.searchParams.get('token');
-    if (!orderId) { res.writeHead(400); res.end('Missing token'); return; }
-    try {
-      const accessToken = await getPaypalToken();
-      // Capture支付
-      const captureRes = await fetch(`${PAYPAL_BASE}/v2/checkout/orders/${orderId}/capture`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' }
-      });
-      const capture = await captureRes.json();
-      if (capture.status !== 'COMPLETED') throw new Error('Capture failed: ' + capture.status);
-      // 获取custom_id拿到userId和credits
-      const customId = capture.purchase_units?.[0]?.payments?.captures?.[0]?.custom_id || '';
-      const [userId, credits] = customId.split(':').map(Number);
-      if (userId && credits) {
-        // 更新积分
-        db.prepare('UPDATE users SET credits = credits + ? WHERE id = ?').run(credits, userId);
-        db.prepare('UPDATE payment_log SET status = ? WHERE paypal_order_id = ?').run('completed', orderId);
-      }
-      // 重定向到成功页面
-      res.writeHead(302, { Location: `${SITE_URL}/profile?payment=success` });
-      res.end();
-    } catch (e) {
-      console.error('PayPal capture error:', e.message);
-      res.writeHead(302, { Location: `${SITE_URL}/profile?payment=error` });
-      res.end();
-    }
-    return;
-  }
-
-  // 支付取消
-  if (req.method === 'GET' && url.pathname === '/api/pay/cancel') {
-    const orderId = url.searchParams.get('token');
-    if (orderId) db.prepare('UPDATE payment_log SET status = ? WHERE paypal_order_id = ?').run('cancelled', orderId);
-    res.writeHead(302, { Location: `${SITE_URL}/pricing?payment=cancel` });
-    res.end();
-    return;
-  }
-
   // --- Enhance API ---
   if (req.method === 'POST' && url.pathname === '/api/enhance') {
     try {
@@ -546,56 +320,45 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      // 支持JSON(base64)和multipart两种格式
-      let imageData, scale;
-      const contentType = req.headers['content-type'] || '';
-      
-      if (contentType.includes('application/json')) {
-        const jsonBody = await collectJSON(req);
-        if (!jsonBody.image) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'No image provided' }));
-          return;
-        }
-        // 去掉base64头部（data:image/png;base64,xxx）
-        const base64Data = jsonBody.image.replace(/^data:image\/\w+;base64,/, '');
-        imageData = Buffer.from(base64Data, 'base64');
-        scale = Number(jsonBody.scale || 2);
-      } else {
-        const boundary = getBoundary(contentType);
-        if (!boundary) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid content type' }));
-          return;
-        }
-        const body = await collectBody(req, 20 * 1024 * 1024);
-        const parts = parseMultipart(body, boundary);
-        const imagePart = parts.find(p => p.name === 'image');
-        const scalePart = parts.find(p => p.name === 'scale');
-        if (!imagePart) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'No image provided' }));
-          return;
-        }
-        imageData = imagePart.data;
-        scale = Number(scalePart?.value || 2);
+      const boundary = getBoundary(req.headers['content-type']);
+      if (!boundary) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid content type' }));
+        return;
       }
-      
+
+      const body = await collectBody(req, 20 * 1024 * 1024);
+      const parts = parseMultipart(body, boundary);
+      const imagePart = parts.find(p => p.name === 'image');
+      const scalePart = parts.find(p => p.name === 'scale');
+
+      if (!imagePart) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'No image provided' }));
+        return;
+      }
+
+      const scale = Number(scalePart?.value || 2);
       const validScale = scale === 4 ? 4 : 2;
 
       await mkdir(TMP_DIR, { recursive: true });
-      const prepId = crypto.randomUUID();
-      const rawPath = path.join(TMP_DIR, `${prepId}-raw`);
-      const inputPath = path.join(TMP_DIR, `${prepId}-input.png`);
-      await writeFile(rawPath, imageData);
-      // 自动放大，确保宽高都>=512px（保持比例，只放大不缩小）
-      await execFileAsync('convert', [rawPath, '-auto-orient', '-resize', 'x512<', '-resize', '512x<', inputPath], { timeout: 10000 });
-      const inputBuffer = await readFile(inputPath);
+      const id = crypto.randomUUID();
+      const rawPath = path.join(TMP_DIR, `${id}-raw`);
+      const inputPath = path.join(TMP_DIR, `${id}-input.png`);
+      const outputPath = path.join(TMP_DIR, `${id}-output.png`);
+
+      await writeFile(rawPath, imagePart.data);
+      await execFileAsync('convert', [rawPath, '-auto-orient', inputPath], { timeout: 10000 });
+
+      const model = validScale === 4 ? 'realesr-animevideov3-x4' : 'realesr-animevideov3-x2';
+      await execFileAsync(REALESRGAN_BIN, [
+        '-i', inputPath, '-o', outputPath, '-n', model, '-s', String(validScale),
+      ], { timeout: 300000 });
+
+      const resultBuffer = await readFile(outputPath);
       await unlink(rawPath).catch(() => {});
       await unlink(inputPath).catch(() => {});
-
-      // 使用阿里云DashScope超分API
-      const resultBuffer = await enhanceWithAliyun(inputBuffer, validScale);
+      await unlink(outputPath).catch(() => {});
 
       // Log usage & deduct credits
       logUsage(userId, ip, validScale);

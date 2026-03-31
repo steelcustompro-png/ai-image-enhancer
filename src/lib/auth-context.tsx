@@ -1,7 +1,9 @@
 'use client';
 import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || '';
+const API_BASE = 'https://api.aiimageenhancer.xyz';
+
+const TOKEN_KEY = 'auth_token';
 
 interface User {
   id: number;
@@ -32,6 +34,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(null);
   const [usage, setUsage] = useState({ used: 0, limit: 1 });
   const [loading, setLoading] = useState(true);
+  const [initialized, setInitialized] = useState(false);
 
   const fetchMe = useCallback(async (t: string | null) => {
     try {
@@ -42,16 +45,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const data = await res.json();
         setUser(data.user);
         setUsage(data.usage);
+      } else {
+        // Token invalid, clear it
+        if (t) {
+          localStorage.removeItem(TOKEN_KEY);
+          setToken(null);
+          setUser(null);
+        }
       }
-    } catch {}
+    } catch (e) {
+      console.error('fetchMe error:', e);
+    }
     setLoading(false);
   }, []);
 
+  // Initialize on mount
   useEffect(() => {
-    const saved = localStorage.getItem('auth_token');
-    if (saved) setToken(saved);
-    fetchMe(saved);
-  }, [fetchMe]);
+    if (typeof window === 'undefined' || initialized) return;
+    
+    // Try to restore token from localStorage
+    const savedToken = localStorage.getItem(TOKEN_KEY);
+    if (savedToken) {
+      setToken(savedToken);
+      fetchMe(savedToken);
+    } else {
+      fetchMe(null);
+    }
+    setInitialized(true);
+  }, [fetchMe, initialized]);
 
   const login = async (credential: string) => {
     const res = await fetch(`${API_BASE}/api/auth/google`, {
@@ -63,15 +84,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const data = await res.json();
     setToken(data.token);
     setUser(data.user);
-    localStorage.setItem('auth_token', data.token);
+    localStorage.setItem(TOKEN_KEY, data.token);
     await fetchMe(data.token);
   };
 
   const logout = () => {
     setToken(null);
     setUser(null);
-    localStorage.removeItem('auth_token');
-    fetchMe(null);
+    localStorage.removeItem(TOKEN_KEY);
+    setUsage({ used: 0, limit: 1 });
+    setLoading(false);
   };
 
   const refreshUsage = async () => fetchMe(token);

@@ -37,17 +37,20 @@ export default function Hero() {
     setLoading(true);
     setProgress('Uploading & enhancing...');
     try {
-      const formData = new FormData();
-      formData.append('image', file);
-      formData.append('scale', String(scale));
+      // Convert file to base64
+      const imageBase64 = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.readAsDataURL(file);
+      });
 
-      const apiBase = process.env.NEXT_PUBLIC_API_URL || '';
-      const headers: Record<string, string> = {};
+      const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.aiimageenhancer.xyz';
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (token) headers['Authorization'] = `Bearer ${token}`;
       const res = await fetch(`${apiBase}/api/enhance`, {
         method: 'POST',
         headers,
-        body: formData,
+        body: JSON.stringify({ image: imageBase64, scale }),
       });
 
       if (!res.ok) {
@@ -84,7 +87,20 @@ export default function Hero() {
     <section className="py-16 px-4">
       <div className="max-w-3xl mx-auto text-center">
         <h1 className="text-4xl md:text-5xl font-bold text-gray-900 mb-4">{t('hero_title')}</h1>
+        <div className="flex items-center justify-center gap-4 mb-6">
+          <span className="text-sm text-gray-500">⭐⭐⭐⭐⭐ </span>
+          <span className="text-sm text-gray-500">4.8 (10,000+ reviews) </span>
+        </div>
         <p className="text-lg text-gray-600 mb-10">{t('hero_subtitle')}</p>
+
+        <div className="flex items-center justify-center gap-8 mb-8 text-sm text-gray-500">
+          <span>✅ {t('step_1')}</span>
+          <span>→</span>
+          <span>✨ {t('step_2')}</span>
+          <span>→</span>
+          <span>⬇️ {t('step_3')}</span>
+        </div>
+        <p className="text-sm text-gray-400 mb-6">{t('step_hint')}</p>
 
         {!file ? (
           <div

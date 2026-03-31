@@ -1,0 +1,12 @@
+module.exports = {
+  apps: [{
+    name: 'enhance-api',
+    script: './api-server.js',
+    env: {
+      PORT: 3001,
+      PAYPAL_CLIENT_ID: 'AWvur6BIdX3gr3xNPneLdR2qvKr0t4kvQs6BNzl2Sfov4BkHOZ6uBgIfxzeYIZATfLZ8IKiTm2R1jnE4',
+      PAYPAL_SECRET: 'ED6gbBGwhv1IMLLvDzc1XzI5LU0KpIhKkBlKjKH9Zi3FTSjcRk7XNE9bEPEVMAAuydR97M5FeW8eT7DU',
+      PAYPAL_SANDBOX: 'true',
+    }
+  }]
+};

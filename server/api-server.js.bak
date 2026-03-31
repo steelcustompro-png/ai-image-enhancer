@@ -1,0 +1,608 @@
+const http = require('http');
+const { writeFile, readFile, unlink, mkdir } = require('fs/promises');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const path = require('path');
+const crypto = require('crypto');
+const Database = require('better-sqlite3');
+const jwt = require('jsonwebtoken');
+
+const execFileAsync = promisify(execFile);
+const REALESRGAN_BIN = '/usr/local/realesrgan/realesrgan-ncnn-vulkan';
+const TMP_DIR = '/tmp/enhance-jobs';
+const PORT = 3001;
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+
+// PayPal Config
+const PAYPAL_CLIENT_ID = 'Ac0ZWI3klkOR3-b0s9TC8VCzHs2hhgBc0V_cPujh_qvtxfFV-CukTOo-9AIX5fDz5cZO3BsycGCj2V9m';
+const PAYPAL_CLIENT_SECRET = 'EEbfAGZS1ecagvoMa0Rwe3WWo8Ju0Srg2wHgzLVTFnNZSNUY6cpmEMUz_evfYWQ0Hoqqks6cmEcS9q3n';
+
+// PayPal OAuth
+async function getPayPalToken() {
+  const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+  const resp = await fetch('https://api.sandbox.paypal.com/v1/oauth2/token', {
+    method: 'POST',
+    headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials',
+  });
+  const data = await resp.json();
+  return data.access_token;
+}
+
+// PayPal Create Order
+async function createPayPalOrder(price, credits) {
+  const accessToken = await getPayPalToken();
+  const resp = await fetch('https://api.sandbox.paypal.com/v2/checkout/orders', {
+    method: 'POST',
+    headers: { 
+      'Authorization': `Bearer ${accessToken}`, 
+      'Content-Type': 'application/json' 
+    },
+    body: JSON.stringify({
+      intent: 'CAPTURE',
+      purchase_units: [{
+        amount: { currency_code: 'USD', value: price.toFixed(2) },
+        custom_id: credits.toString(),
+      }],
+      application_context: {
+        return_url: 'https://aiimageenhancer.xyz/payment?status=success',
+        cancel_url: 'https://aiimageenhancer.xyz/payment?status=cancelled',
+      },
+    }),
+  });
+  return resp.json();
+}
+
+// PayPal Capture Order
+async function capturePayPalOrder(orderId) {
+  const accessToken = await getPayPalToken();
+  const resp = await fetch(`https://api.sandbox.paypal.com/v2/checkout/orders/${orderId}/capture`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+  });
+  return resp.json();
+}
+
+
+// --- Database Setup ---
+const DB_PATH = path.join(__dirname, 'data', 'app.db');
+require('fs').mkdirSync(path.join(__dirname, 'data'), { recursive: true });
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    google_id TEXT UNIQUE NOT NULL,
+    email TEXT NOT NULL,
+    name TEXT,
+    avatar TEXT,
+    plan TEXT DEFAULT 'free',
+    credits INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS usage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    ip TEXT,
+    scale INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_usage_user_date ON usage_log(user_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_usage_ip_date ON usage_log(ip, created_at);
+`);
+
+// --- Daily usage limits ---
+const LIMITS = { anonymous: 1, free: 3, paid: 999999 };
+
+function getTodayUsage(userId, ip) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (userId) {
+    const row = db.prepare(
+      `SELECT COUNT(*) as cnt FROM usage_log WHERE user_id = ? AND created_at >= ?`
+    ).get(userId, today + 'T00:00:00');
+    return row.cnt;
+  }
+  const row = db.prepare(
+    `SELECT COUNT(*) as cnt FROM usage_log WHERE user_id IS NULL AND ip = ? AND created_at >= ?`
+  ).get(ip, today + 'T00:00:00');
+  return row.cnt;
+}
+
+function logUsage(userId, ip, scale) {
+  db.prepare(
+    `INSERT INTO usage_log (user_id, ip, scale) VALUES (?, ?, ?)`
+  ).run(userId, ip, scale);
+}
+
+
+// --- Email Verification Code ---
+const verificationCodes = new Map();
+const deviceTokens = new Map(); // deviceId -> userId
+
+function generateCode() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+function verifyCode(email, code) {
+  const stored = verificationCodes.get(email);
+  if (!stored) return false;
+  if (stored.code !== code) return false;
+  if (Date.now() > stored.expires) {
+    verificationCodes.delete(email);
+    return false;
+  }
+  verificationCodes.delete(email);
+  return true;
+}
+
+function sendVerificationEmail(email, code) {
+  console.log(`Verification code for ${email}: ${code}`);
+  return true;
+}
+
+function getOrCreateEmailUser(email) {
+  let user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  if (!user) {
+    const result = db.prepare('INSERT INTO users (email, credits) VALUES (?, ?)').run(email, 3);
+    user = { id: result.lastInsertRowid, email, credits: 3, plan: 'free' };
+  }
+  return user;
+}
+
+function getUserFromReq(req) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) return null;
+  const token = auth.slice(7);
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch {
+    return null;
+  }
+}
+
+function getOrCreateUser(googleId, email, name, avatar) {
+  let user = db.prepare('SELECT * FROM users WHERE google_id = ?').get(googleId);
+  if (!user) {
+    db.prepare(
+      'INSERT INTO users (google_id, email, name, avatar) VALUES (?, ?, ?, ?)'
+    ).run(googleId, email, name, avatar);
+    user = db.prepare('SELECT * FROM users WHERE google_id = ?').get(googleId);
+  }
+  return user;
+}
+
+function signToken(user) {
+  return jwt.sign(
+    { userId: user.id, email: user.email, name: user.name, avatar: user.avatar, plan: user.plan },
+    JWT_SECRET,
+    { expiresIn: '30d' }
+  );
+}
+
+function verifyToken(token) {
+  try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
+}
+
+function getUserFromReq(req) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  return token ? verifyToken(token) : null;
+}
+
+function getClientIp(req) {
+  return req.headers['x-real-ip'] || req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+}
+
+// --- CORS ---
+const ALLOWED_ORIGINS = [
+  'https://aiimageenhancer.xyz',
+  'https://www.aiimageenhancer.xyz',
+  'https://ai-image-enhancer-f13.pages.dev',
+  'https://api.aiimageenhancer.xyz',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+];
+
+function setCors(req, res) {
+  const origin = req.headers.origin || '';
+  if (ALLOWED_ORIGINS.includes(origin) || /\.pages\.dev$/.test(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGINS[0]);
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Max-Age', '86400');
+}
+
+// --- Multipart parser ---
+function getBoundary(contentType) {
+  if (!contentType) return null;
+  const match = contentType.match(/boundary=(?:"([^"]+)"|([^\s;]+))/);
+  return match ? (match[1] || match[2]) : null;
+}
+
+function collectBody(req, maxSize) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > maxSize) { req.destroy(); reject(new Error('File too large')); return; }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function parseMultipart(body, boundary) {
+  const parts = [];
+  const boundaryBuf = Buffer.from(`--${boundary}`);
+  let start = indexOf(body, boundaryBuf, 0);
+  if (start === -1) return parts;
+  while (true) {
+    start += boundaryBuf.length;
+    if (body[start] === 0x0d && body[start + 1] === 0x0a) start += 2;
+    const nextBoundary = indexOf(body, boundaryBuf, start);
+    if (nextBoundary === -1) break;
+    const partData = body.slice(start, nextBoundary);
+    const headerEnd = indexOf(partData, Buffer.from('\r\n\r\n'), 0);
+    if (headerEnd === -1) { start = nextBoundary; continue; }
+    const headerStr = partData.slice(0, headerEnd).toString('utf8');
+    let content = partData.slice(headerEnd + 4);
+    if (content.length >= 2 && content[content.length - 2] === 0x0d && content[content.length - 1] === 0x0a) {
+      content = content.slice(0, content.length - 2);
+    }
+    const nameMatch = headerStr.match(/name="([^"]+)"/);
+    const name = nameMatch ? nameMatch[1] : '';
+    const filenameMatch = headerStr.match(/filename="([^"]+)"/);
+    if (filenameMatch) {
+      parts.push({ name, filename: filenameMatch[1], data: content });
+    } else {
+      parts.push({ name, value: content.toString('utf8') });
+    }
+    if (indexOf(body, Buffer.from(`--${boundary}--`), nextBoundary) === nextBoundary) break;
+    start = nextBoundary;
+  }
+  return parts;
+}
+
+function indexOf(buf, search, from) {
+  for (let i = from; i <= buf.length - search.length; i++) {
+    let found = true;
+    for (let j = 0; j < search.length; j++) {
+      if (buf[i + j] !== search[j]) { found = false; break; }
+    }
+    if (found) return i;
+  }
+  return -1;
+}
+
+function collectJSON(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString())); } catch(e) { reject(e); } });
+    req.on('error', reject);
+  });
+}
+
+// --- Routes ---
+const server = http.createServer(async (req, res) => {
+  setCors(req, res);
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  // --- Google OAuth callback ---
+  if (req.method === 'POST' && url.pathname === '/api/auth/google') {
+    try {
+      const { credential } = await collectJSON(req);
+      // Verify Google ID token
+      const resp = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${credential}`);
+      const payload = await resp.json();
+      if (payload.error || (GOOGLE_CLIENT_ID && payload.aud !== GOOGLE_CLIENT_ID)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid Google token' }));
+        return;
+      }
+      const user = getOrCreateUser(payload.sub, payload.email, payload.name, payload.picture);
+      const token = signToken(user);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ token, user: { id: user.id, email: user.email, name: user.name, avatar: user.avatar, plan: user.plan } }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // --- Get current user info + usage ---
+  if (req.method === 'GET' && url.pathname === '/api/auth/me') {
+    const tokenUser = getUserFromReq(req);
+    if (!tokenUser) {
+      const ip = getClientIp(req);
+      const used = getTodayUsage(null, ip);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ user: null, usage: { used, limit: LIMITS.anonymous } }));
+      return;
+    }
+    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(tokenUser.userId);
+    const used = getTodayUsage(user.id, null);
+    const plan = user.credits > 0 ? 'paid' : user.plan;
+    const limit = plan === 'paid' ? LIMITS.paid : LIMITS.free;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      user: { id: user.id, email: user.email, name: user.name, avatar: user.avatar, plan, credits: user.credits },
+      usage: { used, limit }
+    }));
+    return;
+  }
+
+
+  // --- Email: Send code ---
+  if (req.method === 'POST' && url.pathname === '/api/auth/email/send') {
+    try {
+      const { email } = await collectJSON(req);
+      if (!email || !email.includes('@')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid email' }));
+        return;
+      }
+      const code = generateCode();
+      verificationCodes.set(email, { code, expires: Date.now() + 10 * 60 * 1000 });
+      sendVerificationEmail(email, code);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // --- Email: Verify code and login ---
+  if (req.method === 'POST' && url.pathname === '/api/auth/email/verify') {
+    try {
+      const { email, code, deviceId } = await collectJSON(req);
+      if (!email || !code) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Email and code required' }));
+        return;
+      }
+      if (!verifyCode(email, code)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid or expired code' }));
+        return;
+      }
+      const user = getOrCreateEmailUser(email);
+      
+      // Generate token
+      const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+      
+      // If deviceId provided, trust it
+      if (deviceId) {
+        deviceTokens.set(deviceId, user.id);
+      }
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ 
+        token, 
+        user: { id: user.id, email: user.email, name: user.name, avatar: user.avatar, plan: user.plan, credits: user.credits } 
+      }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // --- Email: Check device login ---
+  if (req.method === 'POST' && url.pathname === '/api/auth/device') {
+    try {
+      const { deviceId } = await collectJSON(req);
+      if (!deviceId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'deviceId required' }));
+        return;
+      }
+      const userId = deviceTokens.get(deviceId);
+      if (userId) {
+        const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+        const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ 
+          token, 
+          user: { id: user.id, email: user.email, name: user.name, avatar: user.avatar, plan: user.plan, credits: user.credits } 
+        }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ needLogin: true }));
+      }
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+
+  // --- Create PayPal Order ---
+  if (req.method === 'POST' && url.pathname === '/api/pay/create') {
+    const tokenUser = getUserFromReq(req);
+    if (!tokenUser) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Please login first' }));
+      return;
+    }
+    try {
+      const { price, credits } = await collectJSON(req);
+      const order = await createPayPalOrder(price, credits);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ orderId: order.id, approveUrl: order.links?.find(l => l.rel === 'approve')?.href }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // --- Capture PayPal Order ---
+  if (req.method === 'POST' && url.pathname === '/api/pay/capture') {
+    const tokenUser = getUserFromReq(req);
+    if (!tokenUser) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Please login first' }));
+      return;
+    }
+    try {
+      const { orderId } = await collectJSON(req);
+      console.log("Capturing order:", orderId);
+      const capture = await capturePayPalOrder(orderId);
+      console.log("Capture result:", JSON.stringify(capture));
+      console.log("Processing capture...");
+      console.log("Full capture object:", JSON.stringify(capture));
+      let status = capture.status; if (!status && capture.purchase_units && capture.purchase_units[0] && capture.purchase_units[0].payments && capture.purchase_units[0].payments.captures && capture.purchase_units[0].payments.captures[0]) { status = capture.purchase_units[0].payments.captures[0].status; }
+      console.log("Status:", status);
+      if (status === 'COMPLETED' || status === 'Completed') {
+        const credits = capture.purchase_units && capture.purchase_units[0] && capture.purchase_units[0].payments && capture.purchase_units[0].payments.captures && capture.purchase_units[0].payments.captures[0] ? parseInt(capture.purchase_units[0].payments.captures[0].custom_id || '0') : 0;
+        console.log("Adding credits:", credits, "to user:", tokenUser.userId);
+        db.prepare("UPDATE users SET credits = credits + ? WHERE id = ?").run(credits, tokenUser.userId);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, credits }));
+      } else {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Payment not completed, status: ' + status }));
+      }
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // --- Payment History ---
+  if (req.method === 'GET' && url.pathname === '/api/pay/history') {
+    const tokenUser = getUserFromReq(req);
+    if (!tokenUser) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    const payments = db.prepare(
+      'SELECT * FROM payment_log WHERE user_id = ? ORDER BY created_at DESC LIMIT 50'
+    ).all(tokenUser.userId);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ payments }));
+    return;
+  }
+
+  // --- Enhance API ---
+  if (req.method === 'POST' && url.pathname === '/api/enhance') {
+    try {
+      const tokenUser = getUserFromReq(req);
+      const ip = getClientIp(req);
+
+      // Check usage limits
+      let userId = null;
+      let limit = LIMITS.anonymous;
+      if (tokenUser) {
+        userId = tokenUser.userId;
+        const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+        if (user.credits > 0) {
+          limit = LIMITS.paid;
+        } else {
+          limit = LIMITS.free;
+        }
+      }
+      const used = getTodayUsage(userId, ip);
+      if (used >= limit) {
+        // Check if paid user has credits
+        if (userId) {
+          const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(userId);
+          if (user.credits <= 0) {
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Daily limit reached. Please upgrade for more.', code: 'LIMIT_REACHED' }));
+            return;
+          }
+        } else {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Daily limit reached. Sign in for more free uses.', code: 'LIMIT_REACHED' }));
+          return;
+        }
+      }
+
+      const boundary = getBoundary(req.headers['content-type']);
+      if (!boundary) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid content type' }));
+        return;
+      }
+
+      const body = await collectBody(req, 20 * 1024 * 1024);
+      const parts = parseMultipart(body, boundary);
+      const imagePart = parts.find(p => p.name === 'image');
+      const scalePart = parts.find(p => p.name === 'scale');
+
+      if (!imagePart) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'No image provided' }));
+        return;
+      }
+
+      const scale = Number(scalePart?.value || 2);
+      const validScale = scale === 4 ? 4 : 2;
+
+      await mkdir(TMP_DIR, { recursive: true });
+      const id = crypto.randomUUID();
+      const rawPath = path.join(TMP_DIR, `${id}-raw`);
+      const inputPath = path.join(TMP_DIR, `${id}-input.png`);
+      const outputPath = path.join(TMP_DIR, `${id}-output.png`);
+
+      await writeFile(rawPath, imagePart.data);
+      await execFileAsync('convert', [rawPath, '-auto-orient', inputPath], { timeout: 10000 });
+
+      const model = validScale === 4 ? 'realesr-animevideov3-x4' : 'realesr-animevideov3-x2';
+      await execFileAsync(REALESRGAN_BIN, [
+        '-i', inputPath, '-o', outputPath, '-n', model, '-s', String(validScale),
+      ], { timeout: 300000 });
+
+      const resultBuffer = await readFile(outputPath);
+      await unlink(rawPath).catch(() => {});
+      await unlink(inputPath).catch(() => {});
+      await unlink(outputPath).catch(() => {});
+
+      // Log usage & deduct credits
+      logUsage(userId, ip, validScale);
+      if (userId) {
+        const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(userId);
+        if (user.credits > 0) {
+          db.prepare("UPDATE users SET credits = credits - 1 WHERE id = ?").run(userId);
+        }
+      }
+
+      res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Content-Disposition': `attachment; filename="enhanced-${validScale}x.png"`,
+        'Content-Length': resultBuffer.length,
+      });
+      res.end(resultBuffer);
+    } catch (err) {
+      console.error('Enhance error:', err.message || err);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || 'Enhancement failed' }));
+    }
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Enhance API server running on port ${PORT}`);
+  console.log(`Google OAuth: ${GOOGLE_CLIENT_ID ? 'configured' : 'not configured (set GOOGLE_CLIENT_ID)'}`);
+});
