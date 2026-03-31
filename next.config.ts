@@ -4,7 +4,7 @@ const nextConfig: NextConfig = {
   output: "export",
   devIndicators: false,
   experimental: {
-    turbo: {
+    turbopack: {
       root: process.cwd(),
     },
   },
