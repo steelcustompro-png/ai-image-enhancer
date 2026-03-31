@@ -23,7 +23,7 @@ jobs:
         run: npm install
       
       - name: Build
-        run: ./node_modules/.bin/next build
+        run: npm run build
       
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
