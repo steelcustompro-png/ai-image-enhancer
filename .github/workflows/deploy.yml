@@ -21,7 +21,9 @@ jobs:
           cache: 'npm'
       
       - name: Install dependencies
-        run: npm ci
+        run: |
+          npm ci
+          npm list next || echo "Next.js not found after npm ci"
       
       - name: Build
         run: npm run build
