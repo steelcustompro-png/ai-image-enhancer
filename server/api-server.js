@@ -357,14 +357,29 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/api/auth/google') {
     try {
       const { credential } = await collectJSON(req);
-      // Verify Google ID token
-      const resp = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${credential}`);
-      const payload = await resp.json();
-      if (payload.error || (GOOGLE_CLIENT_ID && payload.aud !== GOOGLE_CLIENT_ID)) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid Google token' }));
-        return;
+      let payload;
+      
+      // Handle both ID token (from standard button) and Access token (from custom button)
+      if (credential.includes('.')) {
+        // Verify Google ID token
+        const resp = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${credential}`);
+        payload = await resp.json();
+        if (payload.error || (GOOGLE_CLIENT_ID && payload.aud !== GOOGLE_CLIENT_ID)) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid Google ID token' }));
+          return;
+        }
+      } else {
+        // Verify Google Access token
+        const resp = await fetch(`https://www.googleapis.com/oauth2/v3/userinfo?access_token=${credential}`);
+        payload = await resp.json();
+        if (payload.error) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid Google access token' }));
+          return;
+        }
       }
+      
       const user = getOrCreateUser('google', payload.sub, payload.email, payload.name, payload.picture);
       const token = signToken(user);
       res.writeHead(200, { 'Content-Type': 'application/json' });
