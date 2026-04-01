@@ -34,5 +34,7 @@ jobs:
       - name: Deploy to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ce8dfa7444537590119fb0d30a4e2192
-        run: pnpm dlx wrangler@3 pages deploy out --project-name=ai-image-enhancer-new
+        run: |
+          pnpm dlx wrangler@3 pages deploy out \
+            --project-name=ai-image-enhancer-new \
+            --branch=main
