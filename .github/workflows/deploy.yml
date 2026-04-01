@@ -41,4 +41,4 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ce8dfa7444537590119fb0d30a4e2192
           command: pages deploy out --project-name=ai-image-enhancer-new
-          wranglerVersion: '3.78.2'
+          packageManager: pnpm
