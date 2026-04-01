@@ -119,7 +119,10 @@ db.pragma('journal_mode = WAL');
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    google_id TEXT UNIQUE NOT NULL,
+    google_id TEXT UNIQUE,
+    github_id TEXT UNIQUE,
+    linkedin_id TEXT UNIQUE,
+    facebook_id TEXT UNIQUE,
     email TEXT NOT NULL,
     name TEXT,
     avatar TEXT,
@@ -161,13 +164,23 @@ function logUsage(userId, ip, scale) {
   ).run(userId, ip, scale);
 }
 
-function getOrCreateUser(googleId, email, name, avatar) {
-  let user = db.prepare('SELECT * FROM users WHERE google_id = ?').get(googleId);
+function getOrCreateUser(provider, providerId, email, name, avatar) {
+  const idColumn = `${provider}_id`;
+  let user = db.prepare(`SELECT * FROM users WHERE ${idColumn} = ?`).get(providerId);
   if (!user) {
-    db.prepare(
-      'INSERT INTO users (google_id, email, name, avatar) VALUES (?, ?, ?, ?)'
-    ).run(googleId, email, name, avatar);
-    user = db.prepare('SELECT * FROM users WHERE google_id = ?').get(googleId);
+    // 检查邮箱是否已存在（可能用其他方式登录过）
+    user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+    if (user) {
+      // 绑定新的登录方式
+      db.prepare(`UPDATE users SET ${idColumn} = ?, name = COALESCE(name, ?), avatar = COALESCE(avatar, ?) WHERE id = ?`)
+        .run(providerId, name, avatar, user.id);
+    } else {
+      // 创建新用户
+      db.prepare(
+        `INSERT INTO users (${idColumn}, email, name, avatar) VALUES (?, ?, ?, ?)`
+      ).run(providerId, email, name, avatar);
+      user = db.prepare(`SELECT * FROM users WHERE ${idColumn} = ?`).get(providerId);
+    }
   }
   return user;
 }
@@ -352,7 +365,105 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'Invalid Google token' }));
         return;
       }
-      const user = getOrCreateUser(payload.sub, payload.email, payload.name, payload.picture);
+      const user = getOrCreateUser('google', payload.sub, payload.email, payload.name, payload.picture);
+      const token = signToken(user);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ token, user: { id: user.id, email: user.email, name: user.name, avatar: user.avatar, plan: user.plan } }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/auth/github') {
+    try {
+      const { code } = await collectJSON(req);
+      const clientId = process.env.GITHUB_CLIENT_ID || '';
+      const clientSecret = process.env.GITHUB_CLIENT_SECRET || '';
+      
+      // Exchange code for access token
+      const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code })
+      });
+      const tokenData = await tokenRes.json();
+      if (!tokenData.access_token) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Failed to get GitHub access token' }));
+        return;
+      }
+      
+      // Get user info
+      const userRes = await fetch('https://api.github.com/user', {
+        headers: { 'Authorization': `Bearer ${tokenData.access_token}`, 'User-Agent': 'AI-Image-Enhancer' }
+      });
+      const userData = await userRes.json();
+      
+      const user = getOrCreateUser('github', String(userData.id), userData.email || `${userData.login}@github.user`, userData.name || userData.login, userData.avatar_url);
+      const token = signToken(user);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ token, user: { id: user.id, email: user.email, name: user.name, avatar: user.avatar, plan: user.plan } }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/auth/linkedin') {
+    try {
+      const { code } = await collectJSON(req);
+      const clientId = process.env.LINKEDIN_CLIENT_ID || '';
+      const clientSecret = process.env.LINKEDIN_CLIENT_SECRET || '';
+      const redirectUri = 'https://aiimageenhancer.xyz';
+      
+      // Exchange code for access token
+      const tokenRes = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `grant_type=authorization_code&code=${code}&client_id=${clientId}&client_secret=${clientSecret}&redirect_uri=${encodeURIComponent(redirectUri)}`
+      });
+      const tokenData = await tokenRes.json();
+      if (!tokenData.access_token) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Failed to get LinkedIn access token' }));
+        return;
+      }
+      
+      // Get user info
+      const userRes = await fetch('https://api.linkedin.com/v2/userinfo', {
+        headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
+      });
+      const userData = await userRes.json();
+      
+      const user = getOrCreateUser('linkedin', userData.sub, userData.email, userData.name, userData.picture);
+      const token = signToken(user);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ token, user: { id: user.id, email: user.email, name: user.name, avatar: user.avatar, plan: user.plan } }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/auth/facebook') {
+    try {
+      const { accessToken } = await collectJSON(req);
+      
+      // Get user info
+      const userRes = await fetch(`https://graph.facebook.com/me?fields=id,name,email,picture&access_token=${accessToken}`);
+      const userData = await userRes.json();
+      
+      if (userData.error) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid Facebook token' }));
+        return;
+      }
+      
+      const user = getOrCreateUser('facebook', userData.id, userData.email || `${userData.id}@facebook.user`, userData.name, userData.picture?.data?.url);
       const token = signToken(user);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ token, user: { id: user.id, email: user.email, name: user.name, avatar: user.avatar, plan: user.plan } }));

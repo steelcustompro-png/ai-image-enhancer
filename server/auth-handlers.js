@@ -84,4 +84,156 @@ async function handleGoogleLogin(db, credential) {
   }
 }
 
-module.exports = { handleRegister, handleLogin, handleGoogleLogin, JWT_SECRET };
+// GitHub 登录
+async function handleGitHubLogin(db, code) {
+  try {
+    const clientId = process.env.GITHUB_CLIENT_ID;
+    const clientSecret = process.env.GITHUB_CLIENT_SECRET;
+    
+    // 1. Exchange code for access token
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code })
+    });
+    
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) {
+      return { error: 'Failed to get GitHub access token' };
+    }
+    
+    // 2. Get user info
+    const userRes = await fetch('https://api.github.com/user', {
+      headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
+    });
+    const userData = await userRes.json();
+    
+    const github_id = String(userData.id);
+    const email = userData.email || `${userData.login}@github.placeholder`;
+    
+    // 3. Find or create user
+    let user = db.prepare('SELECT * FROM users WHERE github_id = ? OR email = ?').get(github_id, email);
+    
+    if (!user) {
+      const result = db.prepare(
+        'INSERT INTO users (email, github_id, name, avatar, credits, plan) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run(email, github_id, userData.name || userData.login, userData.avatar_url, 3, 'free');
+      user = { id: result.lastInsertRowid, email, credits: 3, plan: 'free' };
+    } else if (!user.github_id) {
+      db.prepare('UPDATE users SET github_id = ?, avatar = ? WHERE id = ?')
+        .run(github_id, userData.avatar_url, user.id);
+    }
+    
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    return { token, user: { id: user.id, email: user.email, credits: user.credits, plan: user.plan } };
+  } catch (error) {
+    console.error('GitHub auth error:', error);
+    return { error: 'GitHub authentication failed' };
+  }
+}
+
+// LinkedIn 登录
+async function handleLinkedInLogin(db, code) {
+  try {
+    const clientId = process.env.LINKEDIN_CLIENT_ID;
+    const clientSecret = process.env.LINKEDIN_CLIENT_SECRET;
+    const redirectUri = process.env.LINKEDIN_REDIRECT_URI || 'https://aiimageenhancer.xyz';
+    
+    // 1. Exchange code for access token
+    const tokenRes = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: redirectUri
+      })
+    });
+    
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) {
+      return { error: 'Failed to get LinkedIn access token' };
+    }
+    
+    // 2. Get user info
+    const userRes = await fetch('https://api.linkedin.com/v2/userinfo', {
+      headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
+    });
+    const userData = await userRes.json();
+    
+    const linkedin_id = userData.sub;
+    const email = userData.email;
+    
+    // 3. Find or create user
+    let user = db.prepare('SELECT * FROM users WHERE linkedin_id = ? OR email = ?').get(linkedin_id, email);
+    
+    if (!user) {
+      const result = db.prepare(
+        'INSERT INTO users (email, linkedin_id, name, avatar, credits, plan) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run(email, linkedin_id, userData.name, userData.picture, 3, 'free');
+      user = { id: result.lastInsertRowid, email, credits: 3, plan: 'free' };
+    } else if (!user.linkedin_id) {
+      db.prepare('UPDATE users SET linkedin_id = ?, avatar = ? WHERE id = ?')
+        .run(linkedin_id, userData.picture, user.id);
+    }
+    
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    return { token, user: { id: user.id, email: user.email, credits: user.credits, plan: user.plan } };
+  } catch (error) {
+    console.error('LinkedIn auth error:', error);
+    return { error: 'LinkedIn authentication failed' };
+  }
+}
+
+// Facebook 登录
+async function handleFacebookLogin(db, accessToken) {
+  try {
+    // Verify and get user info
+    const appId = process.env.FACEBOOK_APP_ID;
+    const appSecret = process.env.FACEBOOK_APP_SECRET;
+    
+    const userRes = await fetch(`https://graph.facebook.com/me?fields=id,name,email,picture&access_token=${accessToken}`);
+    const userData = await userRes.json();
+    
+    if (userData.error) {
+      return { error: 'Invalid Facebook token' };
+    }
+    
+    const facebook_id = userData.id;
+    const email = userData.email || `${facebook_id}@facebook.placeholder`;
+    
+    // Find or create user
+    let user = db.prepare('SELECT * FROM users WHERE facebook_id = ? OR email = ?').get(facebook_id, email);
+    
+    if (!user) {
+      const result = db.prepare(
+        'INSERT INTO users (email, facebook_id, name, avatar, credits, plan) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run(email, facebook_id, userData.name, userData.picture?.data?.url, 3, 'free');
+      user = { id: result.lastInsertRowid, email, credits: 3, plan: 'free' };
+    } else if (!user.facebook_id) {
+      db.prepare('UPDATE users SET facebook_id = ?, avatar = ? WHERE id = ?')
+        .run(facebook_id, userData.picture?.data?.url, user.id);
+    }
+    
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    return { token, user: { id: user.id, email: user.email, credits: user.credits, plan: user.plan } };
+  } catch (error) {
+    console.error('Facebook auth error:', error);
+    return { error: 'Facebook authentication failed' };
+  }
+}
+
+module.exports = { 
+  handleRegister, 
+  handleLogin, 
+  handleGoogleLogin,
+  handleGitHubLogin,
+  handleLinkedInLogin,
+  handleFacebookLogin,
+  JWT_SECRET 
+};
