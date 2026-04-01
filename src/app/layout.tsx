@@ -71,6 +71,24 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <head>
         <script src="https://accounts.google.com/gsi/client" async defer></script>
         <script
+          async
+          defer
+          crossOrigin="anonymous"
+          src="https://connect.facebook.net/en_US/sdk.js"
+          dangerouslySetInnerHTML={{
+            __html: `
+              window.fbAsyncInit = function() {
+                FB.init({
+                  appId: '123456789',
+                  cookie: true,
+                  xfbml: true,
+                  version: 'v18.0'
+                });
+              };
+            `
+          }}
+        ></script>
+        <script
           type="application/ld+json"
           dangerouslySetInnerHTML={{
             __html: JSON.stringify({
